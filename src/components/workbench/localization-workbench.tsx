@@ -3,9 +3,9 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
-  AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
+  AlertCircle, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
+  Languages, Link2, Loader2, MessageSquare, Pencil, RefreshCw, RotateCcw, RotateCw, Save, Search,
   Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
@@ -31,11 +31,21 @@ const statusClass: Record<SegmentStatus, string> = {
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
 }
+const actionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑译文', confirm: '审校确认', return: '审校退回', 'resolve-conflict': '冲突处理', import: '导入文档', discussion: '新增讨论', 'glossary-change': '术语译名调整',
+}
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
+  glossary: GlossaryTerm[]
+  history: HistoryEntry[]
+}
+
+interface GlossaryDraft {
+  target: string
+  reason: string
 }
 
 export function LocalizationWorkbench() {
@@ -57,6 +67,10 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [editingTermId, setEditingTermId] = useState<string | null>(null)
+  const [termDraft, setTermDraft] = useState<GlossaryDraft>({ target: '', reason: '' })
+  const [returningSegmentId, setReturningSegmentId] = useState<string | null>(null)
+  const [singleReturnReason, setSingleReturnReason] = useState('')
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -99,7 +113,7 @@ export function LocalizationWorkbench() {
   })
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions }) })
+      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions, glossary, history }) })
       if (!response.ok) throw new Error('save failed')
       return response.json()
     },
@@ -146,7 +160,7 @@ export function LocalizationWorkbench() {
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
-          setGlossary(draft.glossary ?? seedGlossary)
+          setGlossary((draft.glossary ?? seedGlossary).map((term) => ({ ...term, revisions: term.revisions ?? [] })))
           setHistory(draft.history ?? seedHistory)
         }
       }
@@ -169,29 +183,111 @@ export function LocalizationWorkbench() {
     return () => window.removeEventListener('beforeunload', beforeUnload)
   }, [dirty])
 
-  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions) })
-  const pushHistoryEntry = (segmentId: string, action: HistoryEntry['action'], before: string, after: string, author = '当前用户') => {
-    setHistory((current) => [{ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, segmentId, author, action, before, after, createdAt: Date.now() }, ...current])
-  }
+  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions), glossary: clone(glossary), history: clone(history) })
+  const makeHistoryEntry = (entry: Omit<HistoryEntry, 'id' | 'createdAt'>): HistoryEntry =>
+    ({ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, createdAt: Date.now(), ...entry })
   const replaceState = (next: EditorSnapshot, markDirty = true) => {
     setPast((current) => [...current.slice(-49), snapshot()])
     setFuture([])
     setSegments(next.segments)
     setDiscussions(next.discussions)
+    setGlossary(next.glossary)
+    setHistory(next.history)
     setCheckedIssues(null)
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
-    const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    const next = segments.map((item) => {
+      if (item.id !== segment.id) return item
+      const term = glossary.find((candidate) => candidate.id === item.reopenedTermId)
+      const matchesNewTerm = term ? targetText.includes(term.target) : false
+      return {
+        ...item,
+        targetText,
+        status: item.status === 'confirmed' ? 'draft' as const : item.status,
+        // 译文已包含当前术语译名时，清除“被术语调整重开”的标记；状态仍由审校确认。
+        reopenedTermId: matchesNewTerm ? undefined : item.reopenedTermId,
+        reopenedPrevious: matchesNewTerm ? undefined : item.reopenedPrevious,
+        reopenedAt: matchesNewTerm ? undefined : item.reopenedAt,
+      }
+    })
+    replaceState({ segments: next, discussions: clone(discussions), glossary: clone(glossary), history: clone(history) })
   }
-  const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
+  /** 术语负责人调整译名：记录版本、复查命中片段、把已确认但不符合新译名的句子转待处理。 */
+  const applyGlossaryRevision = (term: GlossaryTerm, targetAfter: string, reason: string) => {
+    const trimmedTarget = targetAfter.trim()
+    const trimmedReason = reason.trim()
+    if (!trimmedTarget || trimmedTarget === term.target) return
+    const now = Date.now()
+    const revisionId = `rev-${now}-${Math.random().toString(36).slice(2, 6)}`
+    const sourceHit = (segment: Segment) => {
+      if (segment.kind === 'code') return false
+      return term.caseSensitive
+        ? segment.sourceText.includes(term.source)
+        : segment.sourceText.toLowerCase().includes(term.source.toLowerCase())
+    }
+    const reopenedSegmentIds: string[] = []
+    const nextSegments = segments.map((segment) => {
+      // 仅原来“已确认”的句子需要改判为待处理；草稿/待处理/已退回的句子本来就会在复查中暴露问题。
+      if (segment.status !== 'confirmed' || !sourceHit(segment) || !segment.targetText.trim() || segment.targetText.includes(trimmedTarget)) return segment
+      reopenedSegmentIds.push(segment.id)
+      return { ...segment, status: 'needs-work' as const, reopenedTermId: term.id, reopenedPrevious: term.target, reopenedAt: now }
+    })
+    const revision = {
+      id: revisionId,
+      sourceBefore: term.source,
+      targetBefore: term.target,
+      sourceAfter: term.source,
+      targetAfter: trimmedTarget,
+      reason: trimmedReason || '术语负责人调整译名。',
+      author: '术语负责人 · 当前用户',
+      createdAt: now,
+    }
+    const nextGlossary = glossary.map((item) => item.id === term.id
+      ? { ...item, target: trimmedTarget, revisions: [...item.revisions, revision] }
+      : item)
+    const entry = makeHistoryEntry({
+      segmentId: term.id,
+      author: '术语负责人 · 当前用户',
+      action: 'glossary-change',
+      before: `${term.source} → ${term.target}`,
+      after: `${term.source} → ${trimmedTarget}`,
+      reason: revision.reason,
+      termId: term.id,
+      reopenedSegmentIds,
+    })
+    replaceState({ segments: nextSegments, discussions: clone(discussions), glossary: nextGlossary, history: [entry, ...history] })
+    setEditingTermId(null)
+    setTermDraft({ target: '', reason: '' })
+    setFilter('issues')
+  }
+  const updateStatus = (segmentId: string, status: SegmentStatus, reason?: string) => {
     const segment = segments.find((item) => item.id === segmentId)
     if (!segment) return
-    const next = segments.map((item) => item.id === segmentId ? { ...item, status } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
-    pushHistoryEntry(segmentId, action, segment.targetText, segment.targetText)
+    const action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return'
+    const next = segments.map((item) => item.id === segmentId
+      ? { ...item, status, reopenedTermId: undefined, reopenedPrevious: undefined, reopenedAt: undefined }
+      : item)
+    const entry = makeHistoryEntry({
+      segmentId,
+      author: '审校 · 当前用户',
+      action,
+      before: segment.targetText,
+      after: status === 'returned' ? (reason?.trim() ? `退回意见：${reason.trim()}` : '已退回') : segment.targetText,
+      reason: reason?.trim() || undefined,
+      termId: segment.reopenedTermId,
+    })
+    replaceState({ segments: next, discussions: clone(discussions), glossary: clone(glossary), history: [entry, ...history] })
     setSelectedForReturn((current) => { const copy = new Set(current); copy.delete(segmentId); return copy })
+  }
+  const confirmSingleReturn = () => {
+    if (!returningSegmentId) return
+    const id = returningSegmentId
+    setReturningSegmentId(null)
+    const reason = singleReturnReason
+    setSingleReturnReason('')
+    updateStatus(id, 'returned', reason || '请根据术语表修改后重新提交。')
+    void reviewMutation.mutateAsync({ action: 'return', segmentIds: [id], reason: reason || '请根据术语表修改后重新提交。' })
   }
   const undo = () => {
     const previous = past.at(-1)
@@ -200,6 +296,8 @@ export function LocalizationWorkbench() {
     setPast((current) => current.slice(0, -1))
     setSegments(previous.segments)
     setDiscussions(previous.discussions)
+    setGlossary(previous.glossary)
+    setHistory(previous.history)
     setCheckedIssues(null)
     setDirty(true)
   }
@@ -210,6 +308,8 @@ export function LocalizationWorkbench() {
     setFuture((current) => current.slice(1))
     setSegments(next.segments)
     setDiscussions(next.discussions)
+    setGlossary(next.glossary)
+    setHistory(next.history)
     setCheckedIssues(null)
     setDirty(true)
   }
@@ -227,25 +327,39 @@ export function LocalizationWorkbench() {
   const addDiscussion = () => {
     if (!selectedSegment || !discussionDraft.trim()) return
     const nextDiscussion: Discussion = { id: `discussion-${Date.now()}`, segmentId: selectedSegment.id, author: '译者 · 当前用户', body: discussionDraft.trim(), resolved: false, createdAt: Date.now() }
-    replaceState({ segments: clone(segments), discussions: [nextDiscussion, ...discussions] })
-    pushHistoryEntry(selectedSegment.id, 'discussion', '', nextDiscussion.body)
+    const entry = makeHistoryEntry({ segmentId: selectedSegment.id, author: '译者 · 当前用户', action: 'discussion', before: '', after: nextDiscussion.body })
+    replaceState({ segments: clone(segments), discussions: [nextDiscussion, ...discussions], glossary: clone(glossary), history: [entry, ...history] })
     setDiscussionDraft('')
   }
   const bulkReturn = () => {
     if (!selectedForReturn.size) return
     const ids = Array.from(selectedForReturn)
-    const next = segments.map((segment) => ids.includes(segment.id) ? { ...segment, status: 'returned' as const } : segment)
-    replaceState({ segments: next, discussions: clone(discussions) })
-    ids.forEach((id) => pushHistoryEntry(id, 'return', returnReason, `退回原因：${returnReason}`, '审校 · 当前用户'))
-    void reviewMutation.mutateAsync({ action: 'bulk-return', segmentIds: ids, reason: returnReason })
+    const reason = returnReason.trim() || '请根据术语表修改后重新提交。'
+    const entries = ids.map((id) => {
+      const segment = segments.find((item) => item.id === id)
+      return makeHistoryEntry({
+        segmentId: id,
+        author: '审校 · 当前用户',
+        action: 'return',
+        before: segment?.targetText ?? '',
+        after: `退回意见：${reason}`,
+        reason,
+        termId: segment?.reopenedTermId,
+      })
+    })
+    const next = segments.map((segment) => ids.includes(segment.id)
+      ? { ...segment, status: 'returned' as const, reopenedTermId: undefined, reopenedPrevious: undefined, reopenedAt: undefined }
+      : segment)
+    replaceState({ segments: next, discussions: clone(discussions), glossary: clone(glossary), history: [...entries, ...history] })
+    void reviewMutation.mutateAsync({ action: 'bulk-return', segmentIds: ids, reason })
     setSelectedForReturn(new Set())
   }
   const resolveConflict = (conflict: TranslationConflict, strategy: 'local' | 'remote') => {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
     const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
-    if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
+    const entry = makeHistoryEntry({ segmentId: conflict.segmentId, author: strategy === 'local' ? '保留本地' : conflict.remoteAuthor, action: 'resolve-conflict', before: segment?.targetText ?? '', after: targetText })
+    replaceState({ segments: next, discussions: clone(discussions), glossary: clone(glossary), history: [entry, ...history] })
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
   }
   const importMarkdown = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -253,8 +367,8 @@ export function LocalizationWorkbench() {
     if (!file) return
     const imported = parseMarkdown(await file.text())
     if (!imported.length) return
-    replaceState({ segments: imported, discussions: [] })
-    pushHistoryEntry(imported[0].id, 'import', '', file.name)
+    const entry = makeHistoryEntry({ segmentId: imported[0].id, author: '当前用户', action: 'import', before: '', after: file.name })
+    replaceState({ segments: imported, discussions: [], glossary: clone(glossary), history: [entry, ...history] })
     setSelectedSegmentId(imported[0].id)
     event.target.value = ''
   }
@@ -286,7 +400,10 @@ export function LocalizationWorkbench() {
       if (event.key.toLowerCase() === 'j') { event.preventDefault(); nextIssue(1) }
       if (event.key.toLowerCase() === 'k') { event.preventDefault(); nextIssue(-1) }
       if (event.key.toLowerCase() === 'c' && selectedSegment && mode === 'review') updateStatus(selectedSegment.id, 'confirmed')
-      if (event.key.toLowerCase() === 'r' && selectedSegment && mode === 'review') updateStatus(selectedSegment.id, 'returned')
+      if (event.key.toLowerCase() === 'r' && selectedSegment && mode === 'review') {
+        setReturningSegmentId(selectedSegment.id)
+        setSingleReturnReason(returnReason)
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
@@ -330,9 +447,51 @@ export function LocalizationWorkbench() {
       <main className="workbench-grid mx-auto grid max-w-[1800px] grid-cols-[270px_minmax(620px,1fr)_340px] gap-4 p-4 lg:p-5">
         <aside className="workbench-left space-y-4">
           <Card>
-            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
+            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div><p className="mt-2 text-[10px] leading-relaxed text-slate-400">调整译名会留下版本记录，并自动复查已确认的句子：不符合新译名的句子将转为待处理。</p></CardHeader>
             <CardContent className="space-y-2">
-              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
+              {filteredGlossary.map((term) => {
+                const isEditing = editingTermId === term.id
+                const latestRevision = term.revisions.at(-1)
+                return (
+                  <div key={term.id} className={cn('rounded-lg border p-2.5', latestRevision ? 'border-amber-200 bg-amber-50/50' : 'bg-slate-50/70')}>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-800">{term.source}</span>
+                      <div className="flex items-center gap-1">
+                        <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                        <span className="text-xs font-semibold text-blue-700">{term.target}</span>
+                        <button type="button" aria-label={`调整术语 ${term.source} 的译名`} className="ml-1 rounded p-0.5 text-slate-400 hover:bg-blue-100 hover:text-blue-700" onClick={() => { setEditingTermId(isEditing ? null : term.id); setTermDraft({ target: term.target, reason: '' }); setSingleReturnReason('') }}><Pencil className="h-3 w-3" /></button>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p>
+                    {!!term.revisions.length && (
+                      <div className="mt-2 rounded-md border border-amber-200/70 bg-white/70 p-2">
+                        <p className="flex items-center gap-1 text-[10px] font-semibold text-amber-800"><History className="h-3 w-3" />版本修改（{term.revisions.length}）</p>
+                        <div className="mt-1.5 space-y-1.5">
+                          {term.revisions.map((revision) => (
+                            <div key={revision.id} className="border-l-2 border-amber-300 pl-2 text-[10px] leading-4 text-slate-500">
+                              <div className="flex flex-wrap items-center gap-x-1"><span className="rounded bg-red-50 px-1 text-red-600 line-through">{revision.targetBefore}</span><ArrowRight /><span className="rounded bg-emerald-50 px-1 font-semibold text-emerald-700">{revision.targetAfter}</span></div>
+                              <p className="mt-0.5">{revision.reason}</p>
+                              <p className="text-[9px] text-slate-400">{revision.author} · {hydrated ? new Date(revision.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : null}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {isEditing && (
+                      <div className="mt-2 space-y-1.5 rounded-md border border-blue-200 bg-blue-50/60 p-2">
+                        <label className="text-[10px] font-semibold text-blue-800">新译名</label>
+                        <Input value={termDraft.target} onChange={(event) => setTermDraft((current) => ({ ...current, target: event.target.value }))} placeholder={`替换“${term.target}”`} className="h-8 text-xs" autoFocus />
+                        <label className="text-[10px] font-semibold text-blue-800">调整原因（将进入修改历史）</label>
+                        <Input value={termDraft.reason} onChange={(event) => setTermDraft((current) => ({ ...current, reason: event.target.value }))} placeholder="例如：与通用译名区分" className="h-8 text-xs" />
+                        <div className="flex gap-1.5 pt-0.5">
+                          <Button size="sm" className="h-7 text-[11px]" disabled={!termDraft.target.trim() || termDraft.target.trim() === term.target} onClick={() => applyGlossaryRevision(term, termDraft.target, termDraft.reason)}><Check className="h-3 w-3" />保存并复查</Button>
+                          <Button size="sm" variant="ghost" className="h-7 text-[11px]" onClick={() => { setEditingTermId(null); setTermDraft({ target: '', reason: '' }) }}>取消</Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
             </CardContent>
           </Card>
 
@@ -376,10 +535,11 @@ export function LocalizationWorkbench() {
                   <span className="text-[11px] font-semibold text-slate-500">#{String(segment.index).padStart(2, '0')}</span>
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
+                  {segment.reopenedTermId && <Badge variant="warning" className="gap-1 text-[10px]"><History className="h-3 w-3" />术语调整后重开</Badge>}
                   {segment.protectedTokens.length > 0 && <Badge variant="secondary" className="gap-1 text-[10px]"><Variable className="h-3 w-3" />{segment.protectedTokens.length} 个受保护标记</Badge>}
                   {!!segmentIssues.length && <Badge variant="destructive" className="ml-auto">{segmentIssues.length} 个问题</Badge>}
                   <div className={cn('flex gap-1.5', !segmentIssues.length && 'ml-auto')}>
-                    {mode === 'review' && <><Button size="sm" variant="outline" className="border-emerald-300 text-emerald-700 hover:bg-emerald-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'confirmed') }}><Check className="h-3.5 w-3.5" />确认</Button><Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'returned') }}><X className="h-3.5 w-3.5" />退回</Button></>}
+                    {mode === 'review' && <><Button size="sm" variant="outline" className="border-emerald-300 text-emerald-700 hover:bg-emerald-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'confirmed') }}><Check className="h-3.5 w-3.5" />确认</Button><Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => { event.stopPropagation(); setReturningSegmentId(segment.id); setSingleReturnReason(returnReason) }}><UndoDot className="h-3.5 w-3.5" />退回</Button></>}
                   </div>
                 </header>
                 <div className="compare-grid grid grid-cols-2 divide-x">
@@ -394,7 +554,7 @@ export function LocalizationWorkbench() {
                     {segment.protectedTokens.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{segment.protectedTokens.map((token) => <code key={token} className="rounded bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">{token}</code>)}</div>}
                   </div>
                 </div>
-                {!!segmentIssues.length && <div className="border-t bg-red-50/50 px-3.5 py-2.5"><div className="space-y-1.5">{segmentIssues.map((issue) => <div key={issue.id} className="flex items-start gap-2 text-[11px]"><CircleAlert className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', issue.severity === 'error' ? 'text-red-600' : 'text-amber-600')} /><span className={issue.severity === 'error' ? 'text-red-700' : 'text-amber-700'}>{issue.message}</span></div>)}</div></div>}
+                {!!segmentIssues.length && <div className="border-t bg-red-50/50 px-3.5 py-2.5"><div className="space-y-1.5">{segmentIssues.map((issue) => <div key={issue.id} className="flex items-start gap-2 text-[11px]"><CircleAlert className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', issue.severity === 'error' ? 'text-red-600' : 'text-amber-600')} /><div><span className={issue.severity === 'error' ? 'text-red-700' : 'text-amber-700'}>{issue.message}</span>{issue.type === 'glossary' && issue.previous && issue.expected && issue.previous !== issue.expected && <span className="mt-1 flex flex-wrap items-center gap-1 text-[10px]"><span className="rounded bg-white px-1.5 py-0.5 text-red-600 line-through">旧译名：{issue.previous}</span><ArrowRight className="h-3 w-3 text-slate-400" /><span className="rounded bg-emerald-100 px-1.5 py-0.5 font-semibold text-emerald-700">当前要求：{issue.expected}</span></span>}</div></div>)}</div></div>}
                 <footer className="flex items-center gap-2 border-t bg-white px-3 py-2 text-[10px] text-slate-400"><span>点击正文可切换当前片段</span><span>·</span><span>MSW 本地校验</span><button className="ml-auto flex items-center gap-1 text-blue-600 hover:underline" onClick={(event) => { event.stopPropagation(); setSelectedSegmentId(segment.id); document.getElementById('discussion-tab')?.click() }}><MessageSquare className="h-3 w-3" />讨论 {discussions.filter((item) => item.segmentId === segment.id && !item.resolved).length}</button></footer>
               </article>
             )
@@ -411,8 +571,38 @@ export function LocalizationWorkbench() {
                 <div className="mt-3 flex gap-2"><Textarea value={discussionDraft} onChange={(event) => setDiscussionDraft(event.target.value)} rows={2} placeholder="针对当前句子留下讨论…" className="text-xs" /><Button size="icon" className="h-auto self-stretch" onClick={addDiscussion}><Send className="h-4 w-4" /></Button></div>
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
-              <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p>{issue.type === 'glossary' && issue.previous && issue.expected && issue.previous !== issue.expected && <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px]"><span className="rounded bg-white px-1.5 py-0.5 text-red-600 line-through">旧译名：{issue.previous}</span><ArrowRight className="h-3 w-3 text-slate-400" /><span className="rounded bg-emerald-100 px-1.5 py-0.5 font-semibold text-emerald-700">当前要求：{issue.expected}</span></div>}</button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => {
+                const isGlossaryChange = entry.action === 'glossary-change'
+                const targetIndex = segments.find((item) => item.id === entry.segmentId)?.index
+                const relatedTerm = glossary.find((term) => term.id === entry.termId)
+                return (
+                  <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4">
+                    <span className={cn('absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white', isGlossaryChange ? 'bg-amber-500' : entry.action === 'return' ? 'bg-red-500' : entry.action === 'confirm' ? 'bg-emerald-500' : 'bg-blue-500')} />
+                    <div className="flex items-center justify-between gap-2">
+                      <b className="text-[11px] text-slate-700">{entry.author}</b>
+                      <span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : null}</span>
+                    </div>
+                    <p className="mt-1 flex flex-wrap items-center gap-1 text-[10px] text-slate-500">
+                      {isGlossaryChange ? <span className="font-semibold text-amber-700">术语表 · {actionLabel[entry.action]}</span> : <>片段 #{targetIndex ?? '—'} · {actionLabel[entry.action]}</>}
+                      {relatedTerm && <Badge variant="warning" className="px-1 py-0 text-[9px]">关联术语：{relatedTerm.source}</Badge>}
+                    </p>
+                    {isGlossaryChange ? (
+                      <div className="mt-1 text-[10px] leading-4">
+                        <div className="flex flex-wrap items-center gap-1"><span className="rounded bg-red-50 px-1 text-red-600 line-through">{entry.before.split(' → ')[1]}</span><ArrowRight className="h-3 w-3 text-slate-400" /><span className="rounded bg-emerald-50 px-1 font-semibold text-emerald-700">{entry.after.split(' → ')[1]}</span></div>
+                        {entry.reason && <p className="mt-1 text-slate-500">调整原因：{entry.reason}</p>}
+                        <p className="mt-0.5 text-slate-400">{entry.reopenedSegmentIds?.length ? `复查后 ${entry.reopenedSegmentIds.length} 个已确认句子转为待处理：${entry.reopenedSegmentIds.map((id) => `#${segments.find((item) => item.id === id)?.index ?? id}`).join('、')}` : '复查后没有命中的已确认句子。'}</p>
+                      </div>
+                    ) : (
+                      <>
+                        {entry.action === 'return' && entry.reason && <p className="mt-1 rounded bg-red-50 px-1.5 py-1 text-[10px] leading-4 text-red-700">退回意见：{entry.reason}</p>}
+                        {entry.action === 'confirm' && entry.termId && <p className="mt-1 text-[10px] leading-4 text-emerald-700">按新译名复查后重新确认。</p>}
+                        {entry.after && entry.action !== 'return' && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}
+                      </>
+                    )}
+                  </div>
+                )
+              })}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
             </Tabs>
           </Card>
@@ -421,6 +611,21 @@ export function LocalizationWorkbench() {
       </main>
 
       {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      {returningSegmentId && (() => {
+        const target = segments.find((item) => item.id === returningSegmentId)
+        return (
+          <div className="fixed bottom-0 left-0 right-0 z-50 border-t border-red-900/60 bg-slate-950 px-4 py-3 text-white shadow-2xl">
+            <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-3">
+              <UndoDot className="h-4 w-4 text-red-300" />
+              <span className="text-xs">退回片段 <b>#{target?.index ?? ''}</b>{target?.reopenedTermId ? <>（因术语调整重开，意见将与调整记录关联）</> : null}</span>
+              <Input value={singleReturnReason} onChange={(event) => setSingleReturnReason(event.target.value)} placeholder="填写退回意见，将随这次术语调整进入修改历史" className="ml-auto min-w-64 max-w-xl border-slate-700 bg-slate-900 text-white" autoFocus onKeyDown={(event) => { if (event.key === 'Enter') confirmSingleReturn(); if (event.key === 'Escape') setReturningSegmentId(null) }} />
+              <Button variant="destructive" size="sm" disabled={reviewMutation.isPending} onClick={confirmSingleReturn}>{reviewMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}确认退回</Button>
+              <Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setReturningSegmentId(null)}>取消</Button>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

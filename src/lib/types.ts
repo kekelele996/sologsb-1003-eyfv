@@ -12,6 +12,22 @@ export interface Segment {
   status: SegmentStatus
   protectedTokens: string[]
   note: string
+  /** 术语调整导致由“已确认”重开时，记录触发调整的术语 ID。 */
+  reopenedTermId?: string
+  /** 重开时该术语的旧译名，用于问题区对照展示。 */
+  reopenedPrevious?: string
+  reopenedAt?: number
+}
+
+export interface GlossaryRevision {
+  id: string
+  sourceBefore: string
+  targetBefore: string
+  sourceAfter: string
+  targetAfter: string
+  reason: string
+  author: string
+  createdAt: number
 }
 
 export interface GlossaryTerm {
@@ -20,6 +36,8 @@ export interface GlossaryTerm {
   target: string
   caseSensitive: boolean
   note: string
+  /** 每次译名调整留下的版本记录，按时间先后排列。 */
+  revisions: GlossaryRevision[]
 }
 
 export interface Discussion {
@@ -38,15 +56,26 @@ export interface TranslationIssue {
   severity: IssueSeverity
   message: string
   expected?: string
+  /** 术语调整前的旧译名（存在时问题区同时展示旧译名与当前要求）。 */
+  previous?: string
 }
+
+export type HistoryAction = 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'glossary-change'
 
 export interface HistoryEntry {
   id: string
+  /** 普通操作对应片段 ID；术语调整对应术语 ID。 */
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: HistoryAction
   before: string
   after: string
+  /** 退回意见或术语调整原因。 */
+  reason?: string
+  /** 关联的术语 ID：术语调整本身，或针对被重开片段的确认/退回。 */
+  termId?: string
+  /** 术语调整后由“已确认”转为待处理的片段 ID 列表。 */
+  reopenedSegmentIds?: string[]
   createdAt: number
 }
 

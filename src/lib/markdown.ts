@@ -60,9 +60,19 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
     issues.push({ id: `${segment.id}-link`, segmentId: segment.id, type: 'link-mismatch', severity: 'warning', message: `链接目标不一致或缺失：${missingLinks.join('、')}`, expected: missingLinks.join(' ') })
   }
   for (const term of glossary) {
+    if (segment.kind === 'code') continue
     const sourceHit = term.caseSensitive ? segment.sourceText.includes(term.source) : segment.sourceText.toLowerCase().includes(term.source.toLowerCase())
     if (sourceHit && segment.targetText && !segment.targetText.includes(term.target)) {
-      issues.push({ id: `${segment.id}-term-${term.id}`, segmentId: segment.id, type: 'glossary', severity: 'warning', message: `术语“${term.source}”应译为“${term.target}”。`, expected: term.target })
+      const previous = segment.reopenedPrevious ?? term.revisions.at(-1)?.targetBefore
+      issues.push({
+        id: `${segment.id}-term-${term.id}`,
+        segmentId: segment.id,
+        type: 'glossary',
+        severity: 'warning',
+        message: `术语“${term.source}”应译为“${term.target}”。${previous && previous !== term.target ? `术语译名已由“${previous}”调整为“${term.target}”，请按当前要求复查。` : ''}`,
+        expected: term.target,
+        previous,
+      })
     }
   }
   if (segment.kind === 'code' && segment.targetText && segment.sourceText !== segment.targetText) {
