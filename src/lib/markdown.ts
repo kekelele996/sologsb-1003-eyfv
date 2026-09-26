@@ -1,4 +1,4 @@
-import type { GlossaryTerm, Segment, SegmentKind, TranslationIssue } from './types'
+import type { GlossaryRevision, GlossaryTerm, Segment, SegmentKind, TranslationIssue } from './types'
 
 const variablePattern = /\{\{[^{}]+\}\}|\{[A-Za-z_][\w.-]*\}|%\([^)]+\)[sd]|%[sd]/g
 const linkPattern = /\[[^\]]+\]\(([^)]+)\)/g
@@ -42,12 +42,19 @@ export const parseMarkdown = (markdown: string): Segment[] => {
 
 const meaningful = (text: string) => text.replace(/[#*_`>\s]/g, '').length > 1
 
-export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): TranslationIssue[] => {
+export const pendingTermChanges = (segmentId: string, revisions: GlossaryRevision[]) =>
+  revisions.filter((revision) =>
+    revision.affectedSegmentIds.includes(segmentId) &&
+    !revision.reviews.some((review) => review.segmentId === segmentId))
+
+export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[], revisions: GlossaryRevision[] = []): TranslationIssue[] => {
   const issues: TranslationIssue[] = []
   const sourceVariables = extractVariables(segment.sourceText)
   const targetVariables = extractVariables(segment.targetText)
   const sourceLinks = extractLinks(segment.sourceText)
   const targetLinks = extractLinks(segment.targetText)
+  const pendingChanges = pendingTermChanges(segment.id, revisions)
+  const pendingTermIds = new Set(pendingChanges.map((revision) => revision.termId))
   if (meaningful(segment.sourceText) && !segment.targetText.trim()) {
     issues.push({ id: `${segment.id}-missing`, segmentId: segment.id, type: 'missing-translation', severity: 'error', message: '译文为空，存在漏译。' })
   }
@@ -60,10 +67,14 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
     issues.push({ id: `${segment.id}-link`, segmentId: segment.id, type: 'link-mismatch', severity: 'warning', message: `链接目标不一致或缺失：${missingLinks.join('、')}`, expected: missingLinks.join(' ') })
   }
   for (const term of glossary) {
+    if (pendingTermIds.has(term.id)) continue
     const sourceHit = term.caseSensitive ? segment.sourceText.includes(term.source) : segment.sourceText.toLowerCase().includes(term.source.toLowerCase())
     if (sourceHit && segment.targetText && !segment.targetText.includes(term.target)) {
       issues.push({ id: `${segment.id}-term-${term.id}`, segmentId: segment.id, type: 'glossary', severity: 'warning', message: `术语“${term.source}”应译为“${term.target}”。`, expected: term.target })
     }
+  }
+  for (const revision of pendingChanges) {
+    issues.push({ id: `${segment.id}-termchange-${revision.id}`, segmentId: segment.id, type: 'term-change', severity: 'warning', message: `术语“${revision.source}”译名已调整：旧译名“${revision.beforeTarget}”，当前要求“${revision.afterTarget}”。`, expected: revision.afterTarget })
   }
   if (segment.kind === 'code' && segment.targetText && segment.sourceText !== segment.targetText) {
     issues.push({ id: `${segment.id}-code`, segmentId: segment.id, type: 'code-format', severity: 'error', message: '代码块应保持原样，不能翻译或改动格式。' })
@@ -71,8 +82,8 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
   return issues
 }
 
-export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[]) =>
-  segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary))
+export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[], revisions: GlossaryRevision[] = []) =>
+  segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary, revisions))
 
 export const renderTargetMarkdown = (segments: Segment[]) =>
   segments.map((segment) => segment.targetText || segment.sourceText).join('\n\n')

@@ -1,4 +1,4 @@
-import type { Discussion, GlossaryTerm, HistoryEntry, LocalizationDocument, Segment, TranslationConflict } from './types'
+import type { Discussion, GlossaryRevision, GlossaryTerm, HistoryEntry, LocalizationDocument, Segment, TranslationConflict } from './types'
 
 export const seedSegments: Segment[] = [
   { id: 'seg-01', index: 1, kind: 'heading', sourceText: '# Deployment Guide', targetText: '# 部署指南', status: 'confirmed', protectedTokens: [], note: '保留 Markdown 标题层级。' },
@@ -18,6 +18,10 @@ export const seedGlossary: GlossaryTerm[] = [
   { id: 'term-02', source: 'service account', target: '服务账号', caseSensitive: false, note: '统一使用“服务账号”。' },
   { id: 'term-03', source: 'network policy', target: '网络策略', caseSensitive: false, note: 'Kubernetes 资源名称。' },
   { id: 'term-04', source: 'pod', target: 'Pod', caseSensitive: false, note: '资源对象名称保持 Pod。' },
+]
+
+export const seedGlossaryRevisions: GlossaryRevision[] = [
+  { id: 'rev-01', termId: 'term-01', source: 'operator', beforeTarget: '操作符', afterTarget: 'Operator', author: '术语负责人 · Chen', createdAt: Date.now() - 86400000, affectedSegmentIds: [], reviews: [] },
 ]
 
 export const seedDiscussions: Discussion[] = [

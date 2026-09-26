@@ -1,6 +1,6 @@
 export type SegmentKind = 'heading' | 'paragraph' | 'code' | 'link' | 'variable'
 export type SegmentStatus = 'draft' | 'needs-work' | 'confirmed' | 'returned'
-export type IssueType = 'missing-translation' | 'missing-variable' | 'link-mismatch' | 'glossary' | 'code-format'
+export type IssueType = 'missing-translation' | 'missing-variable' | 'link-mismatch' | 'glossary' | 'code-format' | 'term-change'
 export type IssueSeverity = 'error' | 'warning'
 
 export interface Segment {
@@ -20,6 +20,26 @@ export interface GlossaryTerm {
   target: string
   caseSensitive: boolean
   note: string
+}
+
+export interface GlossaryRevisionReview {
+  segmentId: string
+  action: 'reconfirm' | 'return'
+  reason?: string
+  author: string
+  createdAt: number
+}
+
+export interface GlossaryRevision {
+  id: string
+  termId: string
+  source: string
+  beforeTarget: string
+  afterTarget: string
+  author: string
+  createdAt: number
+  affectedSegmentIds: string[]
+  reviews: GlossaryRevisionReview[]
 }
 
 export interface Discussion {
@@ -44,10 +64,11 @@ export interface HistoryEntry {
   id: string
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'glossary-update'
   before: string
   after: string
   createdAt: number
+  revisionId?: string
 }
 
 export interface TranslationConflict {
